@@ -426,14 +426,35 @@ def update_alert_log(alert_log, signals, eligible_symbols, newly_entered):
     return alert_log
 
 
-def build_alert_display_df(alert_log):
+def build_alert_display_df(alert_log, price_lookup=None):
+    """price_lookup: {symbol: current LTP}, from the latest Scanner scan --
+    used to mark-to-market each alert's PnL% against its entry price
+    (the LTP captured at the moment the alert fired)."""
     if not alert_log["alerts"]:
         return pd.DataFrame()
+    price_lookup = price_lookup or {}
     df = pd.DataFrame(alert_log["alerts"])
     if "rvol_pct" not in df.columns:
         df["rvol_pct"] = None
-    df = df[["symbol", "signal", "ltp", "vwap", "rvol_pct", "time"]]
-    df.columns = ["Symbol", "Signal", "LTP", "VWAP", "RVOL%", "Time"]
+
+    def _current_price(row):
+        return price_lookup.get(row["symbol"])
+
+    def _pnl(row):
+        cur = row["current_ltp"]
+        entry = row["ltp"]
+        if cur is None or entry is None:
+            return None
+        if row["signal"] == "BUY":
+            return round((cur - entry) / entry * 100, 2)
+        elif row["signal"] == "SELL":
+            return round((entry - cur) / entry * 100, 2)
+        return None
+
+    df["current_ltp"] = df.apply(_current_price, axis=1)
+    df["pnl_pct"] = df.apply(_pnl, axis=1)
+    df = df[["symbol", "signal", "ltp", "current_ltp", "pnl_pct", "vwap", "rvol_pct", "time"]]
+    df.columns = ["Symbol", "Signal", "EntryPrice", "LTP", "PnL%", "VWAP", "RVOL%", "Time"]
     df = df.sort_values("Time", ascending=False).reset_index(drop=True)
     df.insert(0, "S.No", range(1, len(df) + 1))
     return df
@@ -519,6 +540,7 @@ if os.path.exists(CACHE_PATH):
         st.session_state["alert_log"] = alert_log
 
     df = st.session_state.get("last_scan_df", pd.DataFrame())
+    price_lookup = dict(zip(df["Symbol"], df["LTP"])) if not df.empty else {}
     alert_log = st.session_state.get("alert_log") or load_alert_log()
 
     tab_scanner, tab_levels, tab_alerts = st.tabs(["Scanner", "Key Levels", "Alerts"])
@@ -570,7 +592,7 @@ if os.path.exists(CACHE_PATH):
             f"every refresh it stays active. Only the top {TOP_N_RVOL} symbols by RVOL are eligible "
             f"to alert. Only logged during market hours (9:15-15:30 IST)."
         )
-        alert_df = build_alert_display_df(alert_log)
+        alert_df = build_alert_display_df(alert_log, price_lookup)
         if alert_df.empty:
             st.write("No alerts logged yet.")
         else:
