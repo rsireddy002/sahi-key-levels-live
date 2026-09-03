@@ -40,10 +40,18 @@ THREE-TIER REFRESH MODEL (deliberate, not accidental complexity):
 AUTO-REFRESH: an optional checkbox drives a streamlit-autorefresh timer.
 When on, quotes+signals recompute every AUTO_REFRESH_QUOTES_SECONDS, and
 every ZONE_REFRESH_EVERY_N_TICKS-th tick also triggers a zone refresh.
-This only runs while the browser tab stays open (it's a client-side JS
-timer forcing reruns via websocket, not a background server cron), and it
-means real Upstox API calls firing unattended -- watch for rate-limit
-warnings if the interval is too aggressive for 200+ symbols.
+This only runs while the browser tab stays open, and it means real
+Upstox API calls firing unattended -- watch for rate-limit warnings if
+the interval is too aggressive for 200+ symbols.
+
+RVOL GATE: only the top TOP_N_RVOL symbols by RVOL (today's volume so far
+/ prior-N-day average full-day volume) are eligible to alert, however
+their VWAP/zone signal reads. This is the main lever for cutting alert
+volume -- at most TOP_N_RVOL symbols can be "in play" at once, no matter
+how many symbols technically flip bias. A symbol that newly enters the
+top N with an active signal gets logged even if that exact signal was
+already seen before it dropped out, since re-entering the top N is itself
+a meaningful event.
 
 SETUP:
     pip install streamlit requests pandas numpy streamlit-autorefresh --break-system-packages
@@ -77,8 +85,10 @@ QUOTES_URL = "https://api.upstox.com/v2/market-quote/quotes"
 CACHE_PATH = "sahi_zones_cache.json"
 ALERT_LOG_PATH = "alert_log.json"
 
-DAILY_LOOKBACK_DAYS = 5          # just enough for PrevClose / Change%
+DAILY_LOOKBACK_DAYS = 30         # needs enough history for RVOL_BASELINE_DAYS average
 COMPOSITE_LOOKBACK_DAYS = 18     # matches hvn-lvn-scanner's multi-day window
+RVOL_BASELINE_DAYS = 20          # prior-N-day average full-day volume, same convention as hvn-lvn-scanner
+TOP_N_RVOL = 5                   # only symbols in the top N by RVOL are eligible to alert
 
 COMPOSITE_N_BINS = 50
 INTRADAY_N_BINS = 45
@@ -267,12 +277,15 @@ def run_precompute(token, progress_callback=None):
             intraday_df = fetch_candles(key, token, "minutes", "5", COMPOSITE_LOOKBACK_DAYS)
 
             prev_close = float(daily_df["close"].iloc[-1]) if not daily_df.empty else None
+            avg_daily_volume = (float(daily_df["volume"].tail(RVOL_BASELINE_DAYS).mean())
+                                 if len(daily_df) >= RVOL_BASELINE_DAYS else None)
             composite_zones = compute_composite_zones(intraday_df)
             intraday_zones = compute_intraday_zones(intraday_df)  # seed with today's slice of what we already have
 
             cache[symbol] = {
                 "instrument_key": key,
                 "prev_close": prev_close,
+                "avg_daily_volume": avg_daily_volume,
                 "composite_zones": composite_zones,
                 "intraday_zones": intraday_zones,
                 "last_signal": "-",
@@ -322,7 +335,12 @@ def fetch_batch_quotes(instrument_keys, token):
 def run_live_scan(cache, token):
     """Fast tier: one batch quote call for LTP/VWAP, signal recomputed
     against whichever zones are currently cached (may be a few minutes
-    stale if 'Refresh Zones' hasn't been run recently)."""
+    stale if 'Refresh Zones' hasn't been run recently). Also computes RVOL
+    (today's volume so far / prior-N-day average full-day volume) and
+    ranks the top TOP_N_RVOL symbols -- only those are eligible to alert
+    (see update_alert_log), since unusual volume is the conviction filter
+    that keeps alerts to a handful of genuinely active names instead of
+    every symbol that happens to tick across VWAP."""
     symbols = list(cache.keys())
     instrument_keys = [cache[s]["instrument_key"] for s in symbols]
     key_to_symbol = {cache[s]["instrument_key"]: s for s in symbols}
@@ -338,28 +356,39 @@ def run_live_scan(cache, token):
         c = cache[symbol]
         ltp = q.get("last_price")
         vwap = q.get("average_price")
+        today_volume = q.get("volume")
         prev_close = c.get("prev_close")
+        avg_daily_volume = c.get("avg_daily_volume")
 
         change_pct = (round((ltp - prev_close) / prev_close * 100, 2)
                       if ltp is not None and prev_close else None)
+        rvol_pct = (round(today_volume / avg_daily_volume * 100, 1)
+                    if today_volume is not None and avg_daily_volume else None)
         signal = compute_zone_signal(
             ltp, vwap, c.get("composite_zones", []), c.get("intraday_zones", []),
             min_distance_pct=MIN_SIGNAL_DISTANCE_PCT,
             min_vwap_distance_pct=MIN_VWAP_DISTANCE_PCT,
         )
-        signals[symbol] = {"signal": signal, "ltp": ltp, "vwap": vwap}
+        signals[symbol] = {"signal": signal, "ltp": ltp, "vwap": vwap, "rvol_pct": rvol_pct}
         cache[symbol]["last_signal"] = signal
 
         rows.append({
             "Symbol": symbol, "PrevClose": prev_close, "LTP": ltp,
-            "Change%": change_pct, "VWAP": vwap, "Signal": signal,
+            "Change%": change_pct, "VWAP": vwap, "RVOL%": rvol_pct, "Signal": signal,
         })
+
+    ranked = sorted(
+        [(s, d["rvol_pct"]) for s, d in signals.items() if d["rvol_pct"] is not None],
+        key=lambda x: x[1], reverse=True,
+    )
+    top_n_symbols = set(s for s, _ in ranked[:TOP_N_RVOL])
 
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.sort_values("Symbol").reset_index(drop=True)
+        df["Top5RVOL"] = df["Symbol"].isin(top_n_symbols)
+        df = df.sort_values("RVOL%", ascending=False, na_position="last").reset_index(drop=True)
         df.insert(0, "S.No", range(1, len(df) + 1))
-    return df, signals
+    return df, signals, top_n_symbols
 
 
 def load_alert_log():
@@ -374,12 +403,19 @@ def save_alert_log(log):
         json.dump(log, f, indent=2)
 
 
-def update_alert_log(alert_log, signals):
+def update_alert_log(alert_log, signals, eligible_symbols, newly_entered):
     """Edge-triggered: only logs a new entry the moment a symbol's signal
     changes to a fresh BUY/SELL state, not on every refresh it stays
     active. Gated to market hours -- an after-hours refresh pulls Upstox's
     frozen post-close LTP/VWAP, which must not get logged as a live
-    signal (same bug already fixed in hvn-lvn-scanner's paper trader)."""
+    signal (same bug already fixed in hvn-lvn-scanner's paper trader).
+
+    Also gated to eligible_symbols (the current top TOP_N_RVOL by RVOL) --
+    a symbol outside the top N doesn't have the volume conviction to alert
+    on, however its VWAP/zone signal reads. A symbol in newly_entered
+    (just entered the top N this cycle) gets logged even if its signal is
+    unchanged from before it dropped out -- re-entering the top N is
+    itself a meaningful event, not something to suppress as a duplicate."""
     now = now_ist()
     market_is_open = MARKET_OPEN_TIME <= now.time() < MARKET_CLOSE_TIME
     if not market_is_open:
@@ -388,17 +424,20 @@ def update_alert_log(alert_log, signals):
     last_signal = {a["symbol"]: a["signal"] for a in alert_log["alerts"] if a.get("is_latest")}
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
     for symbol, data in signals.items():
+        if symbol not in eligible_symbols:
+            continue
         sig = data["signal"]
         if sig not in ("BUY", "SELL"):
             continue
-        if last_signal.get(symbol) == sig:
+        is_fresh_entry = symbol in newly_entered
+        if not is_fresh_entry and last_signal.get(symbol) == sig:
             continue
         for a in alert_log["alerts"]:
             if a["symbol"] == symbol:
                 a["is_latest"] = False
         alert_log["alerts"].append({
             "symbol": symbol, "signal": sig, "ltp": data["ltp"], "vwap": data["vwap"],
-            "time": now_str, "is_latest": True,
+            "rvol_pct": data.get("rvol_pct"), "time": now_str, "is_latest": True,
         })
     return alert_log
 
@@ -407,8 +446,8 @@ def build_alert_display_df(alert_log):
     if not alert_log["alerts"]:
         return pd.DataFrame()
     df = pd.DataFrame(alert_log["alerts"])
-    df = df[["symbol", "signal", "ltp", "vwap", "time"]]
-    df.columns = ["Symbol", "Signal", "LTP", "VWAP", "Time"]
+    df = df[["symbol", "signal", "ltp", "vwap", "rvol_pct", "time"]]
+    df.columns = ["Symbol", "Signal", "LTP", "VWAP", "RVOL%", "Time"]
     df = df.sort_values("Time", ascending=False).reset_index(drop=True)
     df.insert(0, "S.No", range(1, len(df) + 1))
     return df
@@ -476,10 +515,14 @@ if os.path.exists(CACHE_PATH):
 
     if refresh_quotes_clicked or refresh_zones_clicked or auto_quotes_due or auto_zone_due or "last_scan_df" not in st.session_state:
         token = get_token()
-        scan_df, signals = run_live_scan(cache, token)
+        scan_df, signals, top_n_symbols = run_live_scan(cache, token)
+
+        prev_top_n_symbols = st.session_state.get("prev_top_n_symbols", set())
+        newly_entered = top_n_symbols - prev_top_n_symbols
+        st.session_state["prev_top_n_symbols"] = top_n_symbols
 
         alert_log = load_alert_log()
-        alert_log = update_alert_log(alert_log, signals)
+        alert_log = update_alert_log(alert_log, signals, top_n_symbols, newly_entered)
         save_alert_log(alert_log)
 
         with open(CACHE_PATH, "w") as f:
@@ -537,8 +580,9 @@ if os.path.exists(CACHE_PATH):
 
     with tab_alerts:
         st.caption(
-            "Logged the moment a symbol's signal changes to a fresh BUY/SELL - not repeated "
-            "every refresh it stays active. Only logged during market hours (9:15-15:30 IST)."
+            f"Logged the moment a symbol's signal changes to a fresh BUY/SELL - not repeated "
+            f"every refresh it stays active. Only the top {TOP_N_RVOL} symbols by RVOL are eligible "
+            f"to alert. Only logged during market hours (9:15-15:30 IST)."
         )
         alert_df = build_alert_display_df(alert_log)
         if alert_df.empty:
