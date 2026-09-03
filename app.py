@@ -379,7 +379,7 @@ def load_alert_log():
     if os.path.exists(ALERT_LOG_PATH):
         with open(ALERT_LOG_PATH, "r") as f:
             return json.load(f)
-    return {"alerts": []}
+    return {"alerts": [], "last_eligible_symbols": []}
 
 
 def save_alert_log(log):
@@ -387,20 +387,28 @@ def save_alert_log(log):
         json.dump(log, f, indent=2)
 
 
-def update_alert_log(alert_log, signals, eligible_symbols, newly_entered):
+def update_alert_log(alert_log, signals, eligible_symbols):
     """Edge-triggered: only logs a new entry the moment a symbol's signal
     changes to a fresh BUY/SELL state, not on every refresh it stays
     active. Gated to market hours -- an after-hours refresh pulls Upstox's
     frozen post-close LTP/VWAP, which must not get logged as a live
     signal (same bug already fixed in hvn-lvn-scanner's paper trader).
 
-    Also gated to eligible_symbols (the current top TOP_N_RVOL by RVOL) --
-    a symbol outside the top N doesn't have the volume conviction to alert
-    on, however its VWAP/zone signal reads. A symbol in newly_entered
-    (just entered the top N this cycle) gets logged even if its signal is
-    unchanged from before it dropped out -- re-entering the top N is
-    itself a meaningful event, not something to suppress as a duplicate."""
+    Also gated to eligible_symbols (the current top TOP_N_RVOL by RVOL).
+    "Newly entered" (just entered the top N this cycle) is tracked via
+    alert_log["last_eligible_symbols"], persisted to disk -- NOT via
+    st.session_state. Session state is per-browser-session, so a page
+    reload or a Streamlit Cloud reconnect resets it to empty, making
+    every currently-eligible symbol look "newly entered" again and
+    re-logging duplicates seconds after the original (this exact bug
+    was seen live: 5 symbols logged twice, 4 seconds apart). Persisting
+    to the same file the dedup check already reads from survives
+    reconnects correctly."""
     now = now_ist()
+    prev_eligible = set(alert_log.get("last_eligible_symbols", []))
+    newly_entered = eligible_symbols - prev_eligible
+    alert_log["last_eligible_symbols"] = list(eligible_symbols)
+
     market_is_open = MARKET_OPEN_TIME <= now.time() < MARKET_CLOSE_TIME
     if not market_is_open:
         return alert_log
@@ -524,12 +532,8 @@ if os.path.exists(CACHE_PATH):
         token = get_token()
         scan_df, signals, top_n_symbols = run_live_scan(cache, token)
 
-        prev_top_n_symbols = st.session_state.get("prev_top_n_symbols", set())
-        newly_entered = top_n_symbols - prev_top_n_symbols
-        st.session_state["prev_top_n_symbols"] = top_n_symbols
-
         alert_log = load_alert_log()
-        alert_log = update_alert_log(alert_log, signals, top_n_symbols, newly_entered)
+        alert_log = update_alert_log(alert_log, signals, top_n_symbols)
         save_alert_log(alert_log)
 
         with open(CACHE_PATH, "w") as f:
