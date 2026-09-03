@@ -37,8 +37,16 @@ THREE-TIER REFRESH MODEL (deliberate, not accidental complexity):
     (may be a few minutes stale) -- this keeps the Scanner table feeling
     responsive without re-fetching candles on every tick.
 
+AUTO-REFRESH: an optional checkbox drives a streamlit-autorefresh timer.
+When on, quotes+signals recompute every AUTO_REFRESH_QUOTES_SECONDS, and
+every ZONE_REFRESH_EVERY_N_TICKS-th tick also triggers a zone refresh.
+This only runs while the browser tab stays open (it's a client-side JS
+timer forcing reruns via websocket, not a background server cron), and it
+means real Upstox API calls firing unattended -- watch for rate-limit
+warnings if the interval is too aggressive for 200+ symbols.
+
 SETUP:
-    pip install streamlit requests pandas numpy --break-system-packages
+    pip install streamlit requests pandas numpy streamlit-autorefresh --break-system-packages
     $env:UPSTOX_ACCESS_TOKEN = "your_token_here"
     streamlit run app.py
 """
@@ -52,6 +60,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from hvn_lvn import build_volume_profile, find_hvn_lvn
 from sahi_style_key_levels import sahi_style_key_levels
@@ -81,6 +90,8 @@ MIN_SIGNAL_DISTANCE_PCT = 0.5    # how far LTP must be from a validated zone to 
 MIN_VWAP_DISTANCE_PCT = 0.15     # how far LTP must be from VWAP before a bias counts as real
                                   # (found necessary live: without this, tiny VWAP wobbles of
                                   # 0.02-0.05% fired repeated BUY/SELL flips on the same symbol)
+AUTO_REFRESH_QUOTES_SECONDS = 60     # quotes + signal recompute cadence when auto-refresh is on
+ZONE_REFRESH_EVERY_N_TICKS = 5       # also do a heavier zone refresh every Nth tick (~5 min)
 
 MARKET_OPEN_TIME = dtime(9, 15)   # IST - no new alerts logged before this
 MARKET_CLOSE_TIME = dtime(15, 30)  # IST - no new alerts logged at/after this
@@ -425,6 +436,18 @@ run_precompute_clicked = col1.button("Run Precompute (slow, once/day)")
 refresh_zones_clicked = col2.button("Refresh Zones (medium, every few min)")
 refresh_quotes_clicked = col3.button("Refresh Quotes (fast)")
 
+auto_refresh_enabled = st.checkbox(
+    "Auto-refresh (quotes every 1 min, zones every 5 min) - only while this tab stays open",
+    value=False,
+)
+auto_tick = st_autorefresh(interval=AUTO_REFRESH_QUOTES_SECONDS * 1000, key="auto_refresh_tick") if auto_refresh_enabled else None
+if "last_auto_tick" not in st.session_state:
+    st.session_state["last_auto_tick"] = -1
+auto_quotes_due = auto_tick is not None and auto_tick != st.session_state["last_auto_tick"]
+if auto_quotes_due:
+    st.session_state["last_auto_tick"] = auto_tick
+auto_zone_due = auto_quotes_due and auto_tick > 0 and auto_tick % ZONE_REFRESH_EVERY_N_TICKS == 0
+
 if run_precompute_clicked:
     token = get_token()
     progress_bar = st.progress(0)
@@ -440,7 +463,7 @@ if os.path.exists(CACHE_PATH):
     with open(CACHE_PATH, "r") as f:
         cache = json.load(f)
 
-    if refresh_zones_clicked:
+    if refresh_zones_clicked or auto_zone_due:
         token = get_token()
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -451,7 +474,7 @@ if os.path.exists(CACHE_PATH):
             cache = run_zone_refresh(cache, token, progress_callback=_cb2)
         st.success("Zone refresh done.")
 
-    if refresh_quotes_clicked or refresh_zones_clicked or "last_scan_df" not in st.session_state:
+    if refresh_quotes_clicked or refresh_zones_clicked or auto_quotes_due or auto_zone_due or "last_scan_df" not in st.session_state:
         token = get_token()
         scan_df, signals = run_live_scan(cache, token)
 
