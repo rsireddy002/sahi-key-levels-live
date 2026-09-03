@@ -64,10 +64,20 @@ def compute_zone_signal(
     composite_zones: List[Dict],
     intraday_zones: List[Dict],
     min_distance_pct: float = 0.5,
+    min_vwap_distance_pct: float = 0.15,
 ) -> str:
     """
     bias = long if LTP > VWAP, short if LTP < VWAP (same convention as the
     existing HVN/LVN signal logic in hvn-lvn-scanner).
+
+    NOISE FILTER: a razor-thin LTP/VWAP gap (e.g. 0.02%) technically has a
+    "bias" but isn't a real move -- it's LTP sitting on top of VWAP and
+    wobbling a few paise either side. min_vwap_distance_pct requires LTP
+    to actually be away from VWAP by a meaningful amount before a bias is
+    considered real at all. Found necessary in practice: a live run
+    without this produced 10 alerts in 3 minutes, several on the same
+    symbol flipping back and forth, almost all with LTP/VWAP gaps under
+    0.05%.
 
     BUY if bias == long AND (no validated zone above LTP, OR the nearest
         one is at least min_distance_pct away -- i.e. room to run before
@@ -75,8 +85,13 @@ def compute_zone_signal(
     SELL mirrors this on the downside.
     Otherwise: no signal.
     """
-    if ltp is None or vwap is None:
+    if ltp is None or vwap is None or ltp <= 0:
         return "-"
+
+    vwap_gap_pct = abs(ltp - vwap) / ltp * 100
+    if vwap_gap_pct < min_vwap_distance_pct:
+        return "-"
+
     _, _, validated = cross_validated_zones(composite_zones, intraday_zones)
 
     if ltp > vwap:
