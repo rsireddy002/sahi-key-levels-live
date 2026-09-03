@@ -1,62 +1,51 @@
 """
-app.py - Sahi Key Levels LIVE (cross-timeframe validated zones + alerts)
+app.py - HVN/LVN Scanner (minimal, single-page version)
 
-Builds on the sahi-key-levels module (vendored below, UNCHANGED) to add:
-  1. Two independently-computed zone sets per symbol: a COMPOSITE profile
-     (18 trading days) and an INTRADAY profile (today's session only).
-  2. Cross-timeframe validation (see zone_validation.py): a zone only
-     counts as a real level if its price range shows up in BOTH profiles.
-     A zone with no multi-day backing, or a composite zone today's session
-     hasn't touched at all, is treated as noise and dropped.
-  3. BUY/SELL alerts, edge-triggered (only logged the moment a symbol's
-     signal changes, not every refresh) and gated to market hours (same
-     fix already applied in hvn-lvn-scanner: an after-hours refresh pulls
-     Upstox's frozen post-close quotes, which must not get logged as a
-     live signal).
-
-VENDORED FILES (copied unchanged from their source repos, per instruction
-to leave the original logic untouched):
-    hvn_lvn.py               <- from hvn-lvn-scanner
-    sahi_style_key_levels.py <- from sahi-key-levels
-
-THREE-TIER REFRESH MODEL (deliberate, not accidental complexity):
-  - "Run Precompute" (slow, once/day): resolves instrument keys, fetches
-    18 days of 5-min candles per symbol, computes the COMPOSITE zone set.
-    This is the expensive step -- same reasoning as hvn-lvn-scanner's
-    Precompute.
-  - "Refresh Zones" (medium, every few minutes -- NOT on every quote tick):
-    re-fetches ONLY today's 5-min candles per symbol (a much lighter
-    historical-candle call than the 18-day Precompute fetch, but still one
-    HTTP call per symbol, so this is not free -- don't wire it to run on
-    every quote refresh across 200+ symbols). Recomputes the INTRADAY zone
-    set, cross-validates against the cached COMPOSITE set, and logs any
-    new BUY/SELL alerts.
-  - "Refresh Quotes" (fast): single batch quote call for LTP/VWAP, same as
-    hvn-lvn-scanner's existing fast refresh. Recomputes each symbol's
-    signal against whatever zones were last computed by "Refresh Zones"
-    (may be a few minutes stale) -- this keeps the Scanner table feeling
-    responsive without re-fetching candles on every tick.
-
-AUTO-REFRESH: an optional checkbox drives a streamlit-autorefresh timer.
-When on, quotes+signals recompute every AUTO_REFRESH_QUOTES_SECONDS, and
-every ZONE_REFRESH_EVERY_N_TICKS-th tick also triggers a zone refresh.
-This only runs while the browser tab stays open, and it means real
-Upstox API calls firing unattended -- watch for rate-limit warnings if
-the interval is too aggressive for 200+ symbols.
-
-RVOL GATE: only the top TOP_N_RVOL symbols by RVOL (today's volume so far
-/ prior-N-day average full-day volume) are eligible to alert, however
-their VWAP/zone signal reads. This is the main lever for cutting alert
-volume -- at most TOP_N_RVOL symbols can be "in play" at once, no matter
-how many symbols technically flip bias. A symbol that newly enters the
-top N with an active signal gets logged even if that exact signal was
-already seen before it dropped out, since re-entering the top N is itself
-a meaningful event.
+ONE table for live scanning, one for paper trades. Scanner columns:
+    S.No | Symbol | PrevClose | LTP | Change% | VWAP | RVOL% | Signal | SignalTime
 
 SETUP:
-    pip install streamlit requests pandas numpy streamlit-autorefresh --break-system-packages
+    pip install streamlit requests pandas numpy --break-system-packages
     $env:UPSTOX_ACCESS_TOKEN = "your_token_here"
     streamlit run app.py
+
+Two-phase architecture (same reasoning as the original scanner, kept because
+it's genuinely necessary, not just inherited complexity):
+  - "Run Precompute" button: slow, once-per-day step. Resolves each
+    symbol's instrument key, fetches daily candles (for PrevClose + RVOL
+    baseline) and 5-min candles (for HVN/LVN + ATR), caches to hvn_cache.json.
+  - "Refresh" button: fast, single batch quote call for LTP/VWAP/today's
+    volume - this is the only thing that needs to run every few seconds.
+
+SIGNAL LOGIC (simplified from the full live_strategy.py version):
+    bias = "long" if LTP > VWAP, "short" if LTP < VWAP
+    stop_distance = ATR (14-period, DAILY bars) - switched from 5-min bars
+        after real trading revealed stops that tight (often under 0.5% on
+        stocks that routinely move 1%+ intraday) got clipped by ordinary
+        noise almost immediately. Daily ATR better matches a same-day
+        holding period that can span most of the session (trades are
+        force-closed at market close - see MARKET_CLOSE_TIME).
+    BUY if bias=="long" AND (no known HVN above, OR the nearest one is at
+        least one ATR away AND an LVN gap sits between LTP and it)
+    SELL mirrors this on the downside
+    Otherwise: no signal
+    NOTE: this drops the order-book-imbalance confirmation that
+    live_strategy.py has, since REST batch quotes don't carry depth data -
+    only the WebSocket feed does. Everything else is the same reasoning.
+
+RVOL DEFINITION USED HERE: today's cumulative volume so far / prior-20-day
+average FULL-DAY volume, with NO time-of-day scaling. This will read low
+early in the session and approach a real comparison by day's end - that's
+expected, not a bug. (If you actually want time-of-day-matched RVOL like
+the original dashboard's rvol_baseline dict, that's a bigger addition -
+say so and it can be built in.)
+
+KEY LEVELS TAB (added): Sahi-app-style collapsed volume-profile zones.
+    Reuses the same build_volume_profile()/find_hvn_lvn() calls that power
+    HVN/LVN above - see sahi_style_key_levels.py for the zone-segmentation
+    logic. Computed once per symbol during Precompute (same cost as the
+    existing HVN/LVN calc) and cached alongside it, so nothing extra runs
+    on every Refresh.
 """
 import os
 import json
@@ -68,11 +57,9 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 
 from hvn_lvn import build_volume_profile, find_hvn_lvn
 from sahi_style_key_levels import sahi_style_key_levels
-from zone_validation import cross_validated_zones, compute_zone_signal
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -82,32 +69,34 @@ def now_ist():
 # ---------------- Config ----------------
 INSTRUMENT_SEARCH_URL = "https://api.upstox.com/v2/instruments/search"
 QUOTES_URL = "https://api.upstox.com/v2/market-quote/quotes"
-CACHE_PATH = "sahi_zones_cache.json"
-ALERT_LOG_PATH = "alert_log.json"
-
-DAILY_LOOKBACK_DAYS = 30         # needs enough history for RVOL_BASELINE_DAYS average
-COMPOSITE_LOOKBACK_DAYS = 18     # matches hvn-lvn-scanner's multi-day window
-RVOL_BASELINE_DAYS = 20          # prior-N-day average full-day volume, same convention as hvn-lvn-scanner
-TOP_N_RVOL = 5                   # only symbols in the top N by RVOL are eligible to alert
-
+CACHE_PATH = "hvn_cache.json"
+INTRADAY_LOOKBACK_DAYS = 18
+DAILY_LOOKBACK_DAYS = 30
+RVOL_BASELINE_DAYS = 20
+ATR_PERIOD = 14
+TODAY_N_BINS = 30
 COMPOSITE_N_BINS = 50
-INTRADAY_N_BINS = 45
-MIN_PROMINENCE_PCT = 0.08
-MIN_BIN_DISTANCE = 2
-MAX_ZONES = 6
-MIN_DISPLAY_PCT = 2.0
-MIN_SIGNAL_DISTANCE_PCT = 0.5    # how far LTP must be from a validated zone to signal
-MIN_VWAP_DISTANCE_PCT = 0.15     # how far LTP must be from VWAP before a bias counts as real
-                                  # (found necessary live: without this, tiny VWAP wobbles of
-                                  # 0.02-0.05% fired repeated BUY/SELL flips on the same symbol)
-AUTO_REFRESH_QUOTES_SECONDS = 60     # quotes + signal recompute cadence when auto-refresh is on
-ZONE_REFRESH_EVERY_N_TICKS = 5       # also do a heavier zone refresh every Nth tick (~5 min)
+MIN_NODE_SEPARATION_BINS = 3
+TRADE_LOG_PATH = "trade_log.json"
+STOP_ATR_MULT = 1.25
+TARGET_R_MULTIPLE = 1.75
 
-MARKET_OPEN_TIME = dtime(9, 15)   # IST - no new alerts logged before this
-MARKET_CLOSE_TIME = dtime(15, 30)  # IST - no new alerts logged at/after this
+# Key Levels tab tuning: finer bins + lower prominence threshold than the
+# HVN/LVN signal logic above, so smaller-but-real clusters (e.g. a brief
+# midday base) surface as their own zone instead of being merged into a
+# neighbor. Tested against synthetic 4-cluster sessions: old defaults
+# (n_bins=30, prominence=0.15) found 3 zones and merged the smallest
+# cluster away; these settings recovered all 4.
+SAHI_ZONE_N_BINS = 45
+SAHI_MIN_PROMINENCE_PCT = 0.08
+SAHI_MIN_BIN_DISTANCE = 2
+SAHI_MAX_ZONES = 6
+SAHI_MIN_DISPLAY_PCT = 2.0
+MARKET_OPEN_TIME = dtime(9, 15)   # IST - no new paper-trade entries logged before this
+MARKET_CLOSE_TIME = dtime(15, 30)  # IST - trades still OPEN at/after this are force-closed
 
-# Same universe as hvn-lvn-scanner. NIFTY/BANKNIFTY handled separately
-# (futures, not equity).
+# Same universe as the original scanner - trim this list if you want fewer
+# symbols. NIFTY/BANKNIFTY are handled separately below (futures, not equity).
 EQUITY_SYMBOLS = [
     "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "SBIN", "AXISBANK",
     "KOTAKBANK", "BAJFINANCE", "BHARTIARTL", "ITC", "LT", "HINDUNILVR",
@@ -159,7 +148,7 @@ def get_token():
         if "UPSTOX_ACCESS_TOKEN" in st.secrets:
             return st.secrets["UPSTOX_ACCESS_TOKEN"].strip()
     except Exception:
-        pass
+        pass  # st.secrets raises if no secrets.toml exists at all (fine for local dev)
     if os.path.exists("upstox_token.txt"):
         with open("upstox_token.txt", "r") as f:
             t = f.read().strip()
@@ -183,10 +172,11 @@ def resolve_equity_instrument_key(symbol, token):
 
 
 def resolve_futures_instrument_key(name, token):
-    """No expiry filter - sorts client-side by expiry (same fix already
-    applied in hvn-lvn-scanner: 'current_month' keyword returns zero
-    results once that month's contract expires but the calendar hasn't
-    rolled over yet)."""
+    """No expiry filter - the 'current_month' keyword returns zero results
+    once that month's contract has expired but the calendar hasn't rolled
+    over yet (confirmed bug, found and fixed earlier). Sorting client-side
+    by expiry and taking the earliest is more robust regardless of keyword
+    edge cases."""
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     params = {"query": name, "exchanges": "NSE", "segments": "FO",
               "instrument_types": "FUT", "page_number": 1, "records": 30}
@@ -218,50 +208,90 @@ def fetch_candles(instrument_key, token, unit, interval, lookback_days):
     return df
 
 
-def compute_composite_zones(intraday_df):
-    """Composite zone set from the FULL multi-day intraday_df (no date
-    filtering -- composite means across all fetched days)."""
-    if intraday_df.empty:
-        return []
-    try:
-        _, shown = sahi_style_key_levels(
-            intraday_df, n_bins=COMPOSITE_N_BINS, max_zones=MAX_ZONES,
-            min_display_pct=MIN_DISPLAY_PCT, min_prominence_pct=MIN_PROMINENCE_PCT,
-            min_bin_distance=MIN_BIN_DISTANCE,
-        )
-        return [asdict(z) for z in shown]
-    except Exception:
-        return []
+def compute_atr(df, period=ATR_PERIOD):
+    if df.empty or len(df) < period + 1:
+        return None
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return round(tr.tail(period).mean(), 4)
 
 
-def compute_intraday_zones(today_only_df):
-    """Intraday zone set from a candle df already scoped to a single
-    session (see fetch_today_candles below)."""
-    if today_only_df.empty:
-        return []
-    today = today_only_df["date"].max()
-    today_df = today_only_df[today_only_df["date"] == today]
-    try:
-        _, shown = sahi_style_key_levels(
-            today_df, n_bins=INTRADAY_N_BINS, max_zones=MAX_ZONES,
-            min_display_pct=MIN_DISPLAY_PCT, min_prominence_pct=MIN_PROMINENCE_PCT,
-            min_bin_distance=MIN_BIN_DISTANCE,
-        )
-        return [asdict(z) for z in shown]
-    except Exception:
-        return []
-
-
-def fetch_today_candles(instrument_key, token):
-    """Lighter than the Precompute fetch: only spans yesterday->today, so
-    each call returns at most ~150 5-min bars instead of 18 days' worth.
-    Still one HTTP call per symbol -- see the "Refresh Zones" docstring
-    note above about not wiring this to the fast quote-refresh loop."""
-    df = fetch_candles(instrument_key, token, "minutes", "5", lookback_days=1)
+def compute_hvn_lvn(df):
+    """Fixed-bin-count sizing, same fix validated earlier today (RELIANCE
+    composite had 13 noisy nodes with ATR-based sizing; fixed bin count
+    across each window's own range fixed it)."""
     if df.empty:
-        return df
+        return [], [], [], []
     today = df["date"].max()
-    return df[df["date"] == today]
+    today_df = df[df["date"] == today]
+
+    def _profile(candle_df, n_bins):
+        try:
+            price_range = candle_df["high"].max() - candle_df["low"].min()
+            bin_size = max(price_range / n_bins, 0.01) if price_range > 0 else 0.01
+            bins, vols = build_volume_profile(candle_df, bin_size=bin_size)
+            result = find_hvn_lvn(bins, vols, min_bin_distance=MIN_NODE_SEPARATION_BINS)
+            return result["hvns"], result["lvns"]
+        except Exception:
+            return [], []
+
+    today_hvn, today_lvn = _profile(today_df, TODAY_N_BINS)
+    composite_hvn, composite_lvn = _profile(df, COMPOSITE_N_BINS)
+    return today_hvn, today_lvn, composite_hvn, composite_lvn
+
+
+def compute_sahi_zones(df):
+    """Sahi-app-style collapsed volume-profile zones for today's session
+    only (see sahi_style_key_levels.py). Returns plain dicts, not
+    KeyLevelZone objects, since this gets persisted to hvn_cache.json."""
+    if df.empty:
+        return []
+    today = df["date"].max()
+    today_df = df[df["date"] == today]
+    try:
+        _, shown_zones = sahi_style_key_levels(
+            today_df,
+            n_bins=SAHI_ZONE_N_BINS,
+            max_zones=SAHI_MAX_ZONES,
+            min_display_pct=SAHI_MIN_DISPLAY_PCT,
+            min_prominence_pct=SAHI_MIN_PROMINENCE_PCT,
+            min_bin_distance=SAHI_MIN_BIN_DISTANCE,
+        )
+        return [asdict(z) for z in shown_zones]
+    except Exception:
+        return []
+
+
+def nearest_hvn_above(pool, price):
+    candidates = [n["price"] for n in pool if n["price"] > price]
+    return min(candidates) if candidates else None
+
+
+def nearest_hvn_below(pool, price):
+    candidates = [n["price"] for n in pool if n["price"] < price]
+    return max(candidates) if candidates else None
+
+
+def has_lvn_between(pool, low, high):
+    return any(low < n["price"] < high for n in pool)
+
+
+def compute_signal(ltp, vwap, atr, today_hvn, today_lvn, composite_hvn, composite_lvn):
+    if ltp is None or vwap is None or atr is None or atr <= 0:
+        return "-"
+    hvn_pool = today_hvn + composite_hvn
+    lvn_pool = today_lvn + composite_lvn
+
+    if ltp > vwap:
+        above = nearest_hvn_above(hvn_pool, ltp)
+        confirms = above is None or (above - ltp >= atr and has_lvn_between(lvn_pool, ltp, above))
+        return "BUY" if confirms else "-"
+    elif ltp < vwap:
+        below = nearest_hvn_below(hvn_pool, ltp)
+        confirms = below is None or (ltp - below >= atr and has_lvn_between(lvn_pool, below, ltp))
+        return "SELL" if confirms else "-"
+    return "-"
 
 
 def run_precompute(token, progress_callback=None):
@@ -274,50 +304,27 @@ def run_precompute(token, progress_callback=None):
             if key is None:
                 continue
             daily_df = fetch_candles(key, token, "days", "1", DAILY_LOOKBACK_DAYS)
-            intraday_df = fetch_candles(key, token, "minutes", "5", COMPOSITE_LOOKBACK_DAYS)
+            intraday_df = fetch_candles(key, token, "minutes", "5", INTRADAY_LOOKBACK_DAYS)
 
             prev_close = float(daily_df["close"].iloc[-1]) if not daily_df.empty else None
             avg_daily_volume = (float(daily_df["volume"].tail(RVOL_BASELINE_DAYS).mean())
                                  if len(daily_df) >= RVOL_BASELINE_DAYS else None)
-            composite_zones = compute_composite_zones(intraday_df)
-            intraday_zones = compute_intraday_zones(intraday_df)  # seed with today's slice of what we already have
+            atr = compute_atr(daily_df)
+            today_hvn, today_lvn, composite_hvn, composite_lvn = compute_hvn_lvn(intraday_df)
+            sahi_zones = compute_sahi_zones(intraday_df)
 
             cache[symbol] = {
-                "instrument_key": key,
-                "prev_close": prev_close,
-                "avg_daily_volume": avg_daily_volume,
-                "composite_zones": composite_zones,
-                "intraday_zones": intraday_zones,
-                "last_signal": "-",
-                "zones_updated_at": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+                "instrument_key": key, "prev_close": prev_close,
+                "avg_daily_volume": avg_daily_volume, "atr": atr,
+                "today_hvn": today_hvn, "today_lvn": today_lvn,
+                "composite_hvn": composite_hvn, "composite_lvn": composite_lvn,
+                "sahi_zones": sahi_zones,
             }
         except Exception as e:
             st.warning(f"{symbol}: precompute failed ({e}), skipping.")
         if progress_callback:
             progress_callback(i + 1, len(all_symbols), symbol)
         time.sleep(0.15)
-
-    with open(CACHE_PATH, "w") as f:
-        json.dump(cache, f)
-    return cache
-
-
-def run_zone_refresh(cache, token, progress_callback=None):
-    """The 'medium' refresh tier: re-fetches TODAY's candles per symbol
-    and recomputes intraday_zones. Composite zones are left untouched
-    (those only change at the next Precompute)."""
-    symbols = list(cache.keys())
-    for i, symbol in enumerate(symbols):
-        try:
-            key = cache[symbol]["instrument_key"]
-            today_df = fetch_today_candles(key, token)
-            cache[symbol]["intraday_zones"] = compute_intraday_zones(today_df)
-            cache[symbol]["zones_updated_at"] = now_ist().strftime("%Y-%m-%d %H:%M:%S")
-        except Exception as e:
-            st.warning(f"{symbol}: zone refresh failed ({e}), keeping previous zones.")
-        if progress_callback:
-            progress_callback(i + 1, len(symbols), symbol)
-        time.sleep(0.1)
 
     with open(CACHE_PATH, "w") as f:
         json.dump(cache, f)
@@ -333,21 +340,12 @@ def fetch_batch_quotes(instrument_keys, token):
 
 
 def run_live_scan(cache, token):
-    """Fast tier: one batch quote call for LTP/VWAP, signal recomputed
-    against whichever zones are currently cached (may be a few minutes
-    stale if 'Refresh Zones' hasn't been run recently). Also computes RVOL
-    (today's volume so far / prior-N-day average full-day volume) and
-    ranks the top TOP_N_RVOL symbols -- only those are eligible to alert
-    (see update_alert_log), since unusual volume is the conviction filter
-    that keeps alerts to a handful of genuinely active names instead of
-    every symbol that happens to tick across VWAP."""
     symbols = list(cache.keys())
     instrument_keys = [cache[s]["instrument_key"] for s in symbols]
     key_to_symbol = {cache[s]["instrument_key"]: s for s in symbols}
     quotes = fetch_batch_quotes(instrument_keys, token)
 
     rows = []
-    signals = {}
     for quote_key, q in quotes.items():
         instrument_key = q.get("instrument_token")
         symbol = key_to_symbol.get(instrument_key)
@@ -364,128 +362,199 @@ def run_live_scan(cache, token):
                       if ltp is not None and prev_close else None)
         rvol_pct = (round(today_volume / avg_daily_volume * 100, 1)
                     if today_volume is not None and avg_daily_volume else None)
-        signal = compute_zone_signal(
-            ltp, vwap, c.get("composite_zones", []), c.get("intraday_zones", []),
-            min_distance_pct=MIN_SIGNAL_DISTANCE_PCT,
-            min_vwap_distance_pct=MIN_VWAP_DISTANCE_PCT,
-        )
-        signals[symbol] = {"signal": signal, "ltp": ltp, "vwap": vwap, "rvol_pct": rvol_pct}
-        cache[symbol]["last_signal"] = signal
+        signal = compute_signal(ltp, vwap, c.get("atr"),
+                                 c.get("today_hvn", []), c.get("today_lvn", []),
+                                 c.get("composite_hvn", []), c.get("composite_lvn", []))
 
         rows.append({
             "Symbol": symbol, "PrevClose": prev_close, "LTP": ltp,
             "Change%": change_pct, "VWAP": vwap, "RVOL%": rvol_pct, "Signal": signal,
         })
 
-    ranked = sorted(
-        [(s, d["rvol_pct"]) for s, d in signals.items() if d["rvol_pct"] is not None],
-        key=lambda x: x[1], reverse=True,
-    )
-    top_n_symbols = set(s for s, _ in ranked[:TOP_N_RVOL])
-
     df = pd.DataFrame(rows)
     if not df.empty:
-        df["Top5RVOL"] = df["Symbol"].isin(top_n_symbols)
-        df = df.sort_values("RVOL%", ascending=False, na_position="last").reset_index(drop=True)
+        df = df.sort_values("Symbol").reset_index(drop=True)
         df.insert(0, "S.No", range(1, len(df) + 1))
-    return df, signals, top_n_symbols
+    return df
 
 
-def load_alert_log():
-    if os.path.exists(ALERT_LOG_PATH):
-        with open(ALERT_LOG_PATH, "r") as f:
+def load_trade_log():
+    if os.path.exists(TRADE_LOG_PATH):
+        with open(TRADE_LOG_PATH, "r") as f:
             return json.load(f)
-    return {"alerts": []}
+    return {"trades": []}
 
 
-def save_alert_log(log):
-    with open(ALERT_LOG_PATH, "w") as f:
+def save_trade_log(log):
+    with open(TRADE_LOG_PATH, "w") as f:
         json.dump(log, f, indent=2)
 
 
-def update_alert_log(alert_log, signals, eligible_symbols, newly_entered):
-    """Edge-triggered: only logs a new entry the moment a symbol's signal
-    changes to a fresh BUY/SELL state, not on every refresh it stays
-    active. Gated to market hours -- an after-hours refresh pulls Upstox's
-    frozen post-close LTP/VWAP, which must not get logged as a live
-    signal (same bug already fixed in hvn-lvn-scanner's paper trader).
+def update_trade_log(log, scan_df, cache):
+    """Two jobs, run on every refresh:
+    1. Check existing OPEN trades against the latest LTP - close them out
+       (STOP HIT / TARGET HIT) if price has reached either level.
+    2. Log any fresh BUY/SELL signal as a new OPEN trade, skipping symbols
+       that already have one open (so a signal that stays active across
+       several refreshes doesn't get logged repeatedly).
+    NOTE: stop/target checks only happen when the app is actually refreshed -
+    if price blows through a level between visits, it's caught at whatever
+    LTP is live the next time someone opens the app, not at the exact level.
+    Same limitation the original dashboard's paper trader documented."""
+    if scan_df.empty:
+        return log
 
-    Also gated to eligible_symbols (the current top TOP_N_RVOL by RVOL) --
-    a symbol outside the top N doesn't have the volume conviction to alert
-    on, however its VWAP/zone signal reads. A symbol in newly_entered
-    (just entered the top N this cycle) gets logged even if its signal is
-    unchanged from before it dropped out -- re-entering the top N is
-    itself a meaningful event, not something to suppress as a duplicate."""
+    price_lookup = scan_df.set_index("Symbol")["LTP"].to_dict()
+
+    # Snapshot BEFORE closing anything - a trade that closes this call
+    # should not immediately reopen a fresh position in the same refresh
+    # (that would look like an instant, unrealistic re-entry right at the
+    # old target/stop price). It becomes eligible again starting next refresh.
+    open_symbols = {t["symbol"] for t in log["trades"] if t["status"] == "OPEN"}
+
     now = now_ist()
+    for t in log["trades"]:
+        if t["status"] != "OPEN":
+            continue
+        current_price = price_lookup.get(t["symbol"])
+
+        # EOD square-off: this is a same-day intraday system with no other
+        # exit mechanism, so an OPEN trade must be force-closed by market
+        # close - otherwise ATR(14, 5-min bars), sized for roughly a
+        # 70-minute move, gets applied against a holding period of many
+        # hours or (if this check didn't exist) even days, which is a
+        # structural mismatch, not a sizing bug. Covers two cases: a trade
+        # still open from an earlier day (should never happen once this
+        # runs daily, but the log is a persisted file, so it's a real
+        # possibility after a gap in usage), and a trade opened today
+        # that's still open once the session has actually ended.
+        #
+        # IMPORTANT: this check runs BEFORE the "no current price" skip
+        # below (unlike the stop/target check, which legitimately needs a
+        # live price to compare against) - a stale/missing quote must not
+        # block the square-off, since the whole point is to guarantee the
+        # position closes by day's end regardless of whether this
+        # particular refresh happened to get fresh data for this symbol.
+        # Falls back to entry_price (flat exit, 0% P&L) only in the rare
+        # case a live price was never available - an approximation, but
+        # far better than leaving the trade open indefinitely.
+        entry_date = datetime.strptime(t["entry_time"], "%Y-%m-%d %H:%M:%S").date()
+        is_stale_from_earlier_day = entry_date < now.date()
+        is_past_close_today = entry_date == now.date() and now.time() >= MARKET_CLOSE_TIME
+        if is_stale_from_earlier_day or is_past_close_today:
+            t["status"] = "EOD SQUARE-OFF"
+            t["exit_price"] = current_price if current_price is not None else t["entry_price"]
+            t["exit_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+            continue
+
+        if current_price is None:
+            continue
+
+        if t["action"] == "BUY":
+            if current_price >= t["target"]:
+                t["status"], t["exit_price"] = "TARGET HIT", current_price
+                t["exit_time"] = now_ist().strftime("%Y-%m-%d %H:%M:%S")
+            elif current_price <= t["stop"]:
+                t["status"], t["exit_price"] = "STOP HIT", current_price
+                t["exit_time"] = now_ist().strftime("%Y-%m-%d %H:%M:%S")
+        else:  # SELL
+            if current_price <= t["target"]:
+                t["status"], t["exit_price"] = "TARGET HIT", current_price
+                t["exit_time"] = now_ist().strftime("%Y-%m-%d %H:%M:%S")
+            elif current_price >= t["stop"]:
+                t["status"], t["exit_price"] = "STOP HIT", current_price
+                t["exit_time"] = now_ist().strftime("%Y-%m-%d %H:%M:%S")
+
+    # New entries only get logged while the market is actually open. A
+    # Refresh outside trading hours (e.g. checking the app in the evening,
+    # as happened above - entries logged at 21:37 IST) pulls Upstox's
+    # frozen post-close LTP/VWAP, which would otherwise get logged as a
+    # live signal against prices that will never move again that day.
+    # This does not affect the EOD square-off loop above, which must keep
+    # running regardless of the current time to close out anything left
+    # OPEN from earlier in the session.
     market_is_open = MARKET_OPEN_TIME <= now.time() < MARKET_CLOSE_TIME
     if not market_is_open:
-        return alert_log
+        return log
 
-    last_signal = {a["symbol"]: a["signal"] for a in alert_log["alerts"] if a.get("is_latest")}
-    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    for symbol, data in signals.items():
-        if symbol not in eligible_symbols:
+    for _, row in scan_df.iterrows():
+        if row["Signal"] not in ("BUY", "SELL") or row["Symbol"] in open_symbols:
             continue
-        sig = data["signal"]
-        if sig not in ("BUY", "SELL"):
+        atr = cache.get(row["Symbol"], {}).get("atr")
+        if not atr:
             continue
-        is_fresh_entry = symbol in newly_entered
-        if not is_fresh_entry and last_signal.get(symbol) == sig:
-            continue
-        for a in alert_log["alerts"]:
-            if a["symbol"] == symbol:
-                a["is_latest"] = False
-        alert_log["alerts"].append({
-            "symbol": symbol, "signal": sig, "ltp": data["ltp"], "vwap": data["vwap"],
-            "rvol_pct": data.get("rvol_pct"), "time": now_str, "is_latest": True,
+        stop_distance = atr * STOP_ATR_MULT
+        entry = row["LTP"]
+        if row["Signal"] == "BUY":
+            stop, target = entry - stop_distance, entry + stop_distance * TARGET_R_MULTIPLE
+        else:
+            stop, target = entry + stop_distance, entry - stop_distance * TARGET_R_MULTIPLE
+        log["trades"].append({
+            "symbol": row["Symbol"], "action": row["Signal"],
+            "entry_time": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+            "entry_price": entry, "stop": round(stop, 2), "target": round(target, 2),
+            "status": "OPEN", "exit_price": None, "exit_time": None,
         })
-    return alert_log
+    return log
 
 
-def build_alert_display_df(alert_log):
-    if not alert_log["alerts"]:
+def build_trade_display_df(log, scan_df):
+    if not log["trades"]:
         return pd.DataFrame()
-    df = pd.DataFrame(alert_log["alerts"])
-    df = df[["symbol", "signal", "ltp", "vwap", "rvol_pct", "time"]]
-    df.columns = ["Symbol", "Signal", "LTP", "VWAP", "RVOL%", "Time"]
-    df = df.sort_values("Time", ascending=False).reset_index(drop=True)
+    price_lookup = scan_df.set_index("Symbol")["LTP"].to_dict() if not scan_df.empty else {}
+    rows = []
+    for t in log["trades"]:
+        mark_price = price_lookup.get(t["symbol"]) if t["status"] == "OPEN" else t["exit_price"]
+        pnl_pct = None
+        if mark_price is not None:
+            if t["action"] == "BUY":
+                pnl_pct = round((mark_price - t["entry_price"]) / t["entry_price"] * 100, 2)
+            else:
+                pnl_pct = round((t["entry_price"] - mark_price) / t["entry_price"] * 100, 2)
+        rows.append({
+            "Symbol": t["symbol"], "Action": t["action"], "EntryTime": t["entry_time"],
+            "EntryPrice": t["entry_price"], "Stop": t["stop"], "Target": t["target"],
+            "Status": t["status"], "ExitPrice": t["exit_price"], "ExitTime": t["exit_time"],
+            "PnL%": pnl_pct,
+        })
+    df = pd.DataFrame(rows)
+    df = df.sort_values("EntryTime", ascending=False).reset_index(drop=True)
     df.insert(0, "S.No", range(1, len(df) + 1))
     return df
 
 
+def attach_signal_times(scan_df, trade_log):
+    """Adds a SignalTime column - when the currently-active signal for each
+    symbol was first logged as an OPEN paper trade. Blank if there's no
+    active signal right now, or if ATR was unavailable at log time (trades
+    without ATR data aren't logged at all, so no timestamp exists for them)."""
+    if scan_df.empty:
+        return scan_df
+    open_entry_times = {t["symbol"]: t["entry_time"] for t in trade_log["trades"] if t["status"] == "OPEN"}
+    scan_df = scan_df.copy()
+    scan_df["SignalTime"] = scan_df["Symbol"].map(open_entry_times)
+    return scan_df
+
+
 def build_zones_display_df(zones):
+    """Formats a symbol's cached sahi_zones list (plain dicts) into a
+    display table for the Key Levels tab, top price to bottom."""
     if not zones:
         return pd.DataFrame()
     df = pd.DataFrame(zones)
-    df = df[["price_mode", "label", "price_low", "price_high"]]
-    df.columns = ["Level", "Zone %", "Range Low", "Range High"]
-    return df.sort_values("Level", ascending=False).reset_index(drop=True)
+    df = df[["price_mode", "label", "price_low", "price_high", "color"]]
+    df.columns = ["Level", "Zone %", "Range Low", "Range High", "Color"]
+    df = df.sort_values("Level", ascending=False).reset_index(drop=True)
+    return df
 
 
-# ---------------- UI (three tabs: Scanner, Key Levels, Alerts) ----------------
-st.set_page_config(page_title="Sahi Key Levels LIVE", layout="wide")
-st.title("Sahi Key Levels LIVE")
-st.caption(
-    "Cross-timeframe validated zones: a level only counts if BOTH the 18-day composite "
-    "profile and today's intraday profile independently show volume clustered there."
-)
+# ---------------- UI (three tabs: Scanner, Paper Trades, Key Levels) ----------------
+st.set_page_config(page_title="HVN/LVN Scanner", layout="wide")
+st.title("HVN/LVN Scanner")
 
-col1, col2, col3 = st.columns(3)
+col1, col2 = st.columns(2)
 run_precompute_clicked = col1.button("Run Precompute (slow, once/day)")
-refresh_zones_clicked = col2.button("Refresh Zones (medium, every few min)")
-refresh_quotes_clicked = col3.button("Refresh Quotes (fast)")
-
-auto_refresh_enabled = st.checkbox(
-    "Auto-refresh (quotes every 1 min, zones every 5 min) - only while this tab stays open",
-    value=False,
-)
-auto_tick = st_autorefresh(interval=AUTO_REFRESH_QUOTES_SECONDS * 1000, key="auto_refresh_tick") if auto_refresh_enabled else None
-if "last_auto_tick" not in st.session_state:
-    st.session_state["last_auto_tick"] = -1
-auto_quotes_due = auto_tick is not None and auto_tick != st.session_state["last_auto_tick"]
-if auto_quotes_due:
-    st.session_state["last_auto_tick"] = auto_tick
-auto_zone_due = auto_quotes_due and auto_tick > 0 and auto_tick % ZONE_REFRESH_EVERY_N_TICKS == 0
+refresh_clicked = col2.button("Refresh (fast)")
 
 if run_precompute_clicked:
     token = get_token()
@@ -502,94 +571,66 @@ if os.path.exists(CACHE_PATH):
     with open(CACHE_PATH, "r") as f:
         cache = json.load(f)
 
-    if refresh_zones_clicked or auto_zone_due:
+    if refresh_clicked or "last_scan_df" not in st.session_state:
         token = get_token()
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        def _cb2(i, total, symbol):
-            progress_bar.progress(i / total)
-            status_text.text(f"{i}/{total}: {symbol}")
-        with st.spinner("Refreshing intraday zones..."):
-            cache = run_zone_refresh(cache, token, progress_callback=_cb2)
-        st.success("Zone refresh done.")
+        scan_df = run_live_scan(cache, token)
 
-    if refresh_quotes_clicked or refresh_zones_clicked or auto_quotes_due or auto_zone_due or "last_scan_df" not in st.session_state:
-        token = get_token()
-        scan_df, signals, top_n_symbols = run_live_scan(cache, token)
+        trade_log = load_trade_log()
+        trade_log = update_trade_log(trade_log, scan_df, cache)
+        save_trade_log(trade_log)
 
-        prev_top_n_symbols = st.session_state.get("prev_top_n_symbols", set())
-        newly_entered = top_n_symbols - prev_top_n_symbols
-        st.session_state["prev_top_n_symbols"] = top_n_symbols
-
-        alert_log = load_alert_log()
-        alert_log = update_alert_log(alert_log, signals, top_n_symbols, newly_entered)
-        save_alert_log(alert_log)
-
-        with open(CACHE_PATH, "w") as f:
-            json.dump(cache, f)
+        scan_df = attach_signal_times(scan_df, trade_log)
 
         st.session_state["last_scan_df"] = scan_df
         st.session_state["last_refresh_time"] = now_ist().strftime("%H:%M:%S")
-        st.session_state["alert_log"] = alert_log
+        st.session_state["trade_log"] = trade_log
 
     df = st.session_state.get("last_scan_df", pd.DataFrame())
-    alert_log = st.session_state.get("alert_log") or load_alert_log()
+    trade_log = st.session_state.get("trade_log") or load_trade_log()
 
-    tab_scanner, tab_levels, tab_alerts = st.tabs(["Scanner", "Key Levels", "Alerts"])
+    tab_scanner, tab_trades, tab_levels = st.tabs(["Scanner", "Paper Trades", "Key Levels"])
 
     with tab_scanner:
         st.caption(f"Last refreshed: {st.session_state.get('last_refresh_time', 'never')}")
         if df.empty:
-            st.write("No data yet - click Refresh Quotes.")
+            st.write("No data yet - click Refresh.")
         else:
             st.dataframe(df, use_container_width=True, hide_index=True)
 
+    with tab_trades:
+        st.caption(
+            "Every BUY/SELL signal is logged here automatically the first time it appears. "
+            "OPEN trades are marked-to-market against the latest refresh; STOP HIT / TARGET HIT lock in "
+            "once price actually reaches that level - checked only when the app is refreshed, not tick-by-tick, "
+            "so a level crossed between visits is caught at the next refresh's price, not the exact level. "
+            "This log persists across refreshes and the app sleeping/waking, but resets on redeploy "
+            "(e.g. after a future code update is pushed) - true persistence across deploys needs an "
+            "external store (Google Sheet, small database, etc.), which hasn't been built yet."
+        )
+        trade_df = build_trade_display_df(trade_log, df)
+        if trade_df.empty:
+            st.write("No trades logged yet.")
+        else:
+            st.dataframe(trade_df, use_container_width=True, hide_index=True)
+            csv = trade_df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download trade log CSV", csv, "trade_log.csv", "text/csv")
+
     with tab_levels:
         st.caption(
-            "Composite = 18-day profile (updates on Precompute). Intraday = today's session "
-            "(updates on Refresh Zones). Only overlapping ranges across both count as validated."
+            "Sahi-app-style collapsed volume-profile zones: today's session profile, cut at the "
+            "LVN valleys already found for HVN/LVN above, each zone labeled with its % share of "
+            "today's volume. Refreshed on each 'Run Precompute', not on every 'Refresh'."
         )
-        symbols_with_zones = [s for s in cache if cache[s].get("composite_zones") or cache[s].get("intraday_zones")]
+        symbols_with_zones = [s for s in cache if cache[s].get("sahi_zones")]
         if not symbols_with_zones:
             st.write("No zones available yet - click 'Run Precompute'.")
         else:
             default_idx = symbols_with_zones.index("NIFTY") if "NIFTY" in symbols_with_zones else 0
             selected_symbol = st.selectbox("Symbol", symbols_with_zones, index=default_idx)
-            c = cache[selected_symbol]
-            st.caption(f"Zones last updated: {c.get('zones_updated_at', 'never')}")
-
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.markdown("**Composite (18-day)**")
-                st.dataframe(build_zones_display_df(c.get("composite_zones", [])),
-                             use_container_width=True, hide_index=True)
-            with col_b:
-                st.markdown("**Intraday (today)**")
-                st.dataframe(build_zones_display_df(c.get("intraday_zones", [])),
-                             use_container_width=True, hide_index=True)
-
-            val_comp, val_intra, _ = cross_validated_zones(
-                c.get("composite_zones", []), c.get("intraday_zones", [])
-            )
-            st.markdown("**Validated (confirmed by both timeframes)**")
-            validated_display = build_zones_display_df(val_comp)
-            if validated_display.empty:
-                st.write("No cross-validated zones yet.")
+            zones_df = build_zones_display_df(cache[selected_symbol]["sahi_zones"])
+            if zones_df.empty:
+                st.write(f"No zones found for {selected_symbol}.")
             else:
-                st.dataframe(validated_display, use_container_width=True, hide_index=True)
-
-    with tab_alerts:
-        st.caption(
-            f"Logged the moment a symbol's signal changes to a fresh BUY/SELL - not repeated "
-            f"every refresh it stays active. Only the top {TOP_N_RVOL} symbols by RVOL are eligible "
-            f"to alert. Only logged during market hours (9:15-15:30 IST)."
-        )
-        alert_df = build_alert_display_df(alert_log)
-        if alert_df.empty:
-            st.write("No alerts logged yet.")
-        else:
-            st.dataframe(alert_df, use_container_width=True, hide_index=True)
-            csv = alert_df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download alert log CSV", csv, "alert_log.csv", "text/csv")
+                st.dataframe(zones_df, use_container_width=True, hide_index=True)
 else:
     st.info("No cache found yet - click 'Run Precompute' first.")
