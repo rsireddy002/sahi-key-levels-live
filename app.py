@@ -78,6 +78,9 @@ MIN_BIN_DISTANCE = 2
 MAX_ZONES = 6
 MIN_DISPLAY_PCT = 2.0
 MIN_SIGNAL_DISTANCE_PCT = 0.5    # how far LTP must be from a validated zone to signal
+MIN_VWAP_DISTANCE_PCT = 0.15     # how far LTP must be from VWAP before a bias counts as real
+                                  # (found necessary live: without this, tiny VWAP wobbles of
+                                  # 0.02-0.05% fired repeated BUY/SELL flips on the same symbol)
 
 MARKET_OPEN_TIME = dtime(9, 15)   # IST - no new alerts logged before this
 MARKET_CLOSE_TIME = dtime(15, 30)  # IST - no new alerts logged at/after this
@@ -331,6 +334,7 @@ def run_live_scan(cache, token):
         signal = compute_zone_signal(
             ltp, vwap, c.get("composite_zones", []), c.get("intraday_zones", []),
             min_distance_pct=MIN_SIGNAL_DISTANCE_PCT,
+            min_vwap_distance_pct=MIN_VWAP_DISTANCE_PCT,
         )
         signals[symbol] = {"signal": signal, "ltp": ltp, "vwap": vwap}
         cache[symbol]["last_signal"] = signal
