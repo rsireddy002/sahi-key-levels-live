@@ -140,23 +140,30 @@ def plot_candles_with_zones(df, composite_zones=None, intraday_zones=None,
     )
 
     fig.update_layout(
-        title=dict(text=title, font=dict(color=TEXT_COLOR, size=16)),
+        title=dict(text=title, font=dict(color=TEXT_COLOR, size=16), y=0.98),
         paper_bgcolor=BG_COLOR,
         plot_bgcolor=BG_COLOR,
         font=dict(color=TEXT_COLOR),
         xaxis=dict(
             title=None, gridcolor=GRID_COLOR, showgrid=True,
             rangeslider_visible=False, color=TEXT_COLOR,
+            # Explicit range pinned to the actual candle timestamps --
+            # without this, Plotly's autorange can pad out to round
+            # calendar-day boundaries (e.g. stretching a single session's
+            # few hours of data out to span 2-3 days), which squeezes all
+            # the real candles into a tiny sliver on narrow/mobile screens.
+            range=[x0, x1],
+            tickformat="%H:%M",
         ),
         yaxis=dict(
             title="Price", gridcolor=GRID_COLOR, showgrid=True, color=TEXT_COLOR,
         ),
-        height=550,
-        margin=dict(l=60, r=150, t=40, b=30),
+        height=500,
+        margin=dict(l=55, r=90, t=70, b=30),
         showlegend=True,
         legend=dict(
-            orientation="h", yanchor="bottom", y=1.02,
-            font=dict(color=TEXT_COLOR), bgcolor="rgba(0,0,0,0)",
+            orientation="h", yanchor="bottom", y=1.06,
+            font=dict(color=TEXT_COLOR, size=10), bgcolor="rgba(0,0,0,0)",
         ),
     )
     return fig
