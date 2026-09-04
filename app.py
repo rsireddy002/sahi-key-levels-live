@@ -45,6 +45,7 @@ SETUP:
     streamlit run app.py
 """
 import os
+import re
 import json
 import time
 from dataclasses import asdict
@@ -92,6 +93,8 @@ ZONE_REFRESH_EVERY_N_TICKS = 5       # also do a heavier zone refresh every Nth 
 
 MARKET_OPEN_TIME = dtime(9, 15)   # IST - no new alerts logged before this
 MARKET_CLOSE_TIME = dtime(15, 30)  # IST - no new alerts logged at/after this
+
+NEAR_ZONE_PCT = 0.3   # how close (%) LTP must be to a validated zone edge to count as "at" it
 
 # Same universe as hvn-lvn-scanner. NIFTY/BANKNIFTY handled separately
 # (futures, not equity).
@@ -344,6 +347,38 @@ def fetch_batch_quotes(instrument_keys, token):
     return resp.json().get("data", {})
 
 
+def nearest_zones(ltp, validated_zones):
+    """Splits validated zones into support-side (price_mode <= ltp) and
+    resistance-side (price_mode > ltp), and returns whichever of each is
+    CLOSEST to ltp, along with the % distance from ltp to that zone's
+    near edge (price_high for support, price_low for resistance -- the
+    edge price would actually touch first)."""
+    support, support_dist = None, None
+    resistance, resistance_dist = None, None
+    for z in validated_zones:
+        if ltp is None:
+            break
+        if z["price_mode"] <= ltp:
+            dist = abs(ltp - z["price_high"]) / ltp * 100
+            if support_dist is None or dist < support_dist:
+                support, support_dist = z, dist
+        else:
+            dist = abs(z["price_low"] - ltp) / ltp * 100
+            if resistance_dist is None or dist < resistance_dist:
+                resistance, resistance_dist = z, dist
+    return support, support_dist, resistance, resistance_dist
+
+
+def build_setup_display_df(rows, zone_kind):
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    label = "Support" if zone_kind == "support" else "Resistance"
+    df = df[["symbol", "ltp", "vwap", "zone_level", "zone_pct", "distance_pct"]]
+    df.columns = ["Symbol", "LTP", "VWAP", f"{label} level", "Zone %", "Distance %"]
+    return df.sort_values("Distance %").reset_index(drop=True)
+
+
 def run_live_scan(cache, token):
     """Fast tier: one batch quote call for LTP/VWAP, signal recomputed
     against whichever zones are currently cached (may be a few minutes
@@ -360,6 +395,9 @@ def run_live_scan(cache, token):
 
     rows = []
     signals = {}
+    bottom_setups = []   # near support + just crossed above VWAP
+    top_setups = []      # near resistance + just closed below VWAP
+
     for quote_key, q in quotes.items():
         instrument_key = q.get("instrument_token")
         symbol = key_to_symbol.get(instrument_key)
@@ -384,6 +422,39 @@ def run_live_scan(cache, token):
         signals[symbol] = {"signal": signal, "ltp": ltp, "vwap": vwap, "rvol_pct": rvol_pct}
         cache[symbol]["last_signal"] = signal
 
+        # --- Setup detection: near support/resistance + VWAP cross ---
+        # "Just crossed" is edge-triggered off the PREVIOUS scan's
+        # above/below state, persisted in the cache (same pattern as
+        # update_alert_log's edge-triggering below) so it survives
+        # across reruns instead of re-firing on every refresh.
+        if ltp is not None and vwap is not None:
+            val_comp, _, _ = cross_validated_zones(
+                c.get("composite_zones", []), c.get("intraday_zones", [])
+            )
+            support, support_dist, resistance, resistance_dist = nearest_zones(ltp, val_comp)
+
+            vwap_above_now = ltp > vwap
+            prev_vwap_above = c.get("prev_vwap_above")
+            crossed_up = prev_vwap_above is False and vwap_above_now
+            crossed_down = prev_vwap_above is True and not vwap_above_now
+            cache[symbol]["prev_vwap_above"] = vwap_above_now
+
+            if support is not None and support_dist is not None and support_dist <= NEAR_ZONE_PCT and crossed_up:
+                bottom_setups.append({
+                    "symbol": symbol, "ltp": ltp, "vwap": round(vwap, 2),
+                    "zone_level": support["price_mode"],
+                    "zone_pct": _pct_from_label_safe(support["label"]),
+                    "distance_pct": round(support_dist, 2),
+                })
+
+            if resistance is not None and resistance_dist is not None and resistance_dist <= NEAR_ZONE_PCT and crossed_down:
+                top_setups.append({
+                    "symbol": symbol, "ltp": ltp, "vwap": round(vwap, 2),
+                    "zone_level": resistance["price_mode"],
+                    "zone_pct": _pct_from_label_safe(resistance["label"]),
+                    "distance_pct": round(resistance_dist, 2),
+                })
+
         rows.append({
             "Symbol": symbol, "PrevClose": prev_close, "LTP": ltp,
             "Change%": change_pct, "VWAP": vwap, "RVOL%": rvol_pct, "Signal": signal,
@@ -400,7 +471,12 @@ def run_live_scan(cache, token):
         df["Top5RVOL"] = df["Symbol"].isin(top_n_symbols)
         df = df.sort_values("RVOL%", ascending=False, na_position="last").reset_index(drop=True)
         df.insert(0, "S.No", range(1, len(df) + 1))
-    return df, signals, top_n_symbols
+    return df, signals, top_n_symbols, bottom_setups, top_setups
+
+
+def _pct_from_label_safe(label):
+    m = re.search(r"[\d.]+", str(label))
+    return float(m.group()) if m else 0.0
 
 
 def load_alert_log():
@@ -558,7 +634,7 @@ if os.path.exists(CACHE_PATH):
 
     if refresh_quotes_clicked or refresh_zones_clicked or auto_quotes_due or auto_zone_due or "last_scan_df" not in st.session_state:
         token = get_token()
-        scan_df, signals, top_n_symbols = run_live_scan(cache, token)
+        scan_df, signals, top_n_symbols, bottom_setups, top_setups = run_live_scan(cache, token)
 
         alert_log = load_alert_log()
         alert_log = update_alert_log(alert_log, signals, top_n_symbols)
@@ -570,6 +646,8 @@ if os.path.exists(CACHE_PATH):
         st.session_state["last_scan_df"] = scan_df
         st.session_state["last_refresh_time"] = now_ist().strftime("%H:%M:%S")
         st.session_state["alert_log"] = alert_log
+        st.session_state["bottom_setups"] = bottom_setups
+        st.session_state["top_setups"] = top_setups
 
     df = st.session_state.get("last_scan_df", pd.DataFrame())
     price_lookup = dict(zip(df["Symbol"], df["LTP"])) if not df.empty else {}
@@ -578,7 +656,9 @@ if os.path.exists(CACHE_PATH):
     symbols_with_zones = [s for s in cache if cache[s].get("composite_zones") or cache[s].get("intraday_zones")]
     default_idx = symbols_with_zones.index("NIFTY") if "NIFTY" in symbols_with_zones else 0
 
-    tab_scanner, tab_levels, tab_chart, tab_alerts = st.tabs(["Scanner", "Key Levels", "Chart", "Alerts"])
+    tab_scanner, tab_levels, tab_chart, tab_setups, tab_alerts = st.tabs(
+        ["Scanner", "Key Levels", "Chart", "Setups", "Alerts"]
+    )
 
     with tab_scanner:
         st.caption(f"Last refreshed: {st.session_state.get('last_refresh_time', 'never')}")
@@ -643,6 +723,25 @@ if os.path.exists(CACHE_PATH):
                     title=f"{chart_symbol} - price with key levels",
                 )
                 st.plotly_chart(fig, use_container_width=True)
+
+    with tab_setups:
+        st.caption(
+            f"Edge-triggered: a symbol appears only the cycle it happens, not every refresh "
+            f"it stays true. 'Near' means within {NEAR_ZONE_PCT}% of the validated zone's edge."
+        )
+        st.markdown("**At support, just crossed above VWAP** (possible bounce)")
+        bottom_df = build_setup_display_df(st.session_state.get("bottom_setups", []), "support")
+        if bottom_df.empty:
+            st.write("None this cycle.")
+        else:
+            st.dataframe(bottom_df, use_container_width=True, hide_index=True)
+
+        st.markdown("**At resistance, just closed below VWAP** (possible rejection)")
+        top_df = build_setup_display_df(st.session_state.get("top_setups", []), "resistance")
+        if top_df.empty:
+            st.write("None this cycle.")
+        else:
+            st.dataframe(top_df, use_container_width=True, hide_index=True)
 
     with tab_alerts:
         st.caption(

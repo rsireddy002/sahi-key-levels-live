@@ -1,19 +1,19 @@
 """
-Candlestick chart with key levels overlaid.
+Candlestick chart with key levels + session VWAP overlaid.
 
 Validated zones are classified relative to the LAST close price:
   - zone below last close  -> SUPPORT   (green line + label)
   - zone above last close  -> RESISTANCE (red line + label)
-This makes the chart instantly readable: green below price, red above --
-no need to read numbers to know which is which.
-
 Composite/intraday zones remain thin, unlabeled gray reference lines.
+Session VWAP is computed from the candle df itself (cumulative typical
+price weighted by volume) -- no extra API call needed.
 
 Matches the zone dict shape from sahi_style_key_levels():
     {"price_mode": float, "label": str (e.g. "31%"), "price_low": float, "price_high": float}
 """
 
 import re
+import numpy as np
 import plotly.graph_objects as go
 
 SUPPORT_FILL = "rgba(99, 153, 34, 0.12)"
@@ -21,6 +21,7 @@ SUPPORT_LINE = "#3B6D11"
 RESISTANCE_FILL = "rgba(226, 75, 74, 0.12)"
 RESISTANCE_LINE = "#A32D2D"
 REFERENCE_LINE = "rgba(136, 135, 128, 0.5)"  # faint gray, no label
+VWAP_LINE = "#7F77DD"  # purple, distinct from support/resistance/candles
 
 
 def _pct_from_label(label):
@@ -28,10 +29,23 @@ def _pct_from_label(label):
     return float(m.group()) if m else 0.0
 
 
+def _session_vwap(df):
+    """Cumulative typical-price VWAP for a single session's candle df.
+    Requires 'high','low','close','volume' columns already scoped to one day."""
+    typical = (df["high"] + df["low"] + df["close"]) / 3.0
+    cum_vol = df["volume"].cumsum()
+    cum_tp_vol = (typical * df["volume"]).cumsum()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vwap = cum_tp_vol / cum_vol.replace(0, np.nan)
+    return vwap.ffill()
+
+
 def plot_candles_with_zones(df, composite_zones=None, intraday_zones=None,
-                             validated_zones=None, title="Price with key levels"):
+                             validated_zones=None, title="Price with key levels",
+                             show_vwap=True):
     """
-    df: OHLC dataframe with columns ['timestamp','open','high','low','close'].
+    df: OHLC(V) dataframe with columns ['timestamp','open','high','low','close']
+        and ideally 'volume' (needed for the VWAP line).
     composite_zones / intraday_zones: shown as faint reference lines only.
     validated_zones: classified as support/resistance vs last close,
         shown as shaded bands with price + zone% labels.
@@ -45,6 +59,14 @@ def plot_candles_with_zones(df, composite_zones=None, intraday_zones=None,
         decreasing_line_color="#E24B4A",
         name="Price",
     ))
+
+    if show_vwap and "volume" in df.columns and df["volume"].sum() > 0:
+        vwap_series = _session_vwap(df)
+        fig.add_trace(go.Scatter(
+            x=df["timestamp"], y=vwap_series,
+            mode="lines", name="VWAP",
+            line=dict(color=VWAP_LINE, width=1.5, dash="solid"),
+        ))
 
     x0, x1 = df["timestamp"].iloc[0], df["timestamp"].iloc[-1]
     last_close = float(df["close"].iloc[-1])
@@ -113,6 +135,7 @@ def plot_candles_with_zones(df, composite_zones=None, intraday_zones=None,
         xaxis_rangeslider_visible=False,
         height=550,
         margin=dict(l=60, r=150, t=40, b=30),
-        showlegend=False,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
     )
     return fig
