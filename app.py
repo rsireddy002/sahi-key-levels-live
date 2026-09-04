@@ -373,10 +373,20 @@ def build_setup_display_df(rows, zone_kind):
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
-    label = "Support" if zone_kind == "support" else "Resistance"
-    df = df[["symbol", "ltp", "vwap", "zone_level", "zone_pct", "distance_pct"]]
-    df.columns = ["Symbol", "LTP", "VWAP", f"{label} level", "Zone %", "Distance %"]
-    return df.sort_values("Distance %").reset_index(drop=True)
+    if zone_kind == "support":
+        df = df[["symbol", "ltp", "vwap", "zone_level", "zone_pct", "distance_pct",
+                  "room_level", "room_pct"]]
+        df.columns = ["Symbol", "LTP", "VWAP", "Support level", "Zone %", "Distance %",
+                      "Next resistance", "Room to run %"]
+        # best risk/reward (most room before hitting resistance) floats to top;
+        # symbols with no resistance overhead at all show blank Room and sort last
+        return df.sort_values("Room to run %", ascending=False, na_position="last").reset_index(drop=True)
+    else:
+        df = df[["symbol", "ltp", "vwap", "zone_level", "zone_pct", "distance_pct",
+                  "room_level", "room_pct"]]
+        df.columns = ["Symbol", "LTP", "VWAP", "Resistance level", "Zone %", "Distance %",
+                      "Next support", "Room to fall %"]
+        return df.sort_values("Room to fall %", ascending=False, na_position="last").reset_index(drop=True)
 
 
 def run_live_scan(cache, token):
@@ -445,6 +455,13 @@ def run_live_scan(cache, token):
                     "zone_level": support["price_mode"],
                     "zone_pct": _pct_from_label_safe(support["label"]),
                     "distance_pct": round(support_dist, 2),
+                    # "room to run": distance from LTP up to the next resistance
+                    # overhead. None means no validated resistance zone was found
+                    # above current price at all -- i.e. open air, arguably the
+                    # BEST case for a bounce, not a bad one, so it's not filtered
+                    # out, just shown blank and sorted to the bottom by default.
+                    "room_level": resistance["price_mode"] if resistance is not None else None,
+                    "room_pct": round(resistance_dist, 2) if resistance_dist is not None else None,
                 })
 
             if resistance is not None and resistance_dist is not None and resistance_dist <= NEAR_ZONE_PCT and crossed_down:
@@ -453,6 +470,11 @@ def run_live_scan(cache, token):
                     "zone_level": resistance["price_mode"],
                     "zone_pct": _pct_from_label_safe(resistance["label"]),
                     "distance_pct": round(resistance_dist, 2),
+                    # "room to fall": distance from LTP down to the next support
+                    # floor. None means no validated support zone found below --
+                    # i.e. open air on the downside if this rejection plays out.
+                    "room_level": support["price_mode"] if support is not None else None,
+                    "room_pct": round(support_dist, 2) if support_dist is not None else None,
                 })
 
         rows.append({
@@ -727,7 +749,11 @@ if os.path.exists(CACHE_PATH):
     with tab_setups:
         st.caption(
             f"Edge-triggered: a symbol appears only the cycle it happens, not every refresh "
-            f"it stays true. 'Near' means within {NEAR_ZONE_PCT}% of the validated zone's edge."
+            f"it stays true. 'Near' means within {NEAR_ZONE_PCT}% of the validated zone's edge. "
+            f"'Room to run/fall' is the distance to the NEXT zone on the opposite side -- more "
+            f"room means more space for the move to actually play out before hitting resistance "
+            f"(or support, for the rejection table). Blank room = no validated zone found that "
+            f"direction at all, i.e. open air."
         )
         st.markdown("**At support, just crossed above VWAP** (possible bounce)")
         bottom_df = build_setup_display_df(st.session_state.get("bottom_setups", []), "support")

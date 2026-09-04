@@ -1,10 +1,11 @@
 """
-Candlestick chart with key levels + session VWAP overlaid.
+Candlestick chart with key levels + session VWAP, styled like a trading
+platform (dark background, TradingView-style candle colors and gridlines).
 
 Validated zones are classified relative to the LAST close price:
   - zone below last close  -> SUPPORT   (green line + label)
   - zone above last close  -> RESISTANCE (red line + label)
-Composite/intraday zones remain thin, unlabeled gray reference lines.
+Composite/intraday zones remain thin, unlabeled reference lines.
 Session VWAP is computed from the candle df itself (cumulative typical
 price weighted by volume) -- no extra API call needed.
 
@@ -16,12 +17,21 @@ import re
 import numpy as np
 import plotly.graph_objects as go
 
-SUPPORT_FILL = "rgba(99, 153, 34, 0.12)"
-SUPPORT_LINE = "#3B6D11"
-RESISTANCE_FILL = "rgba(226, 75, 74, 0.12)"
-RESISTANCE_LINE = "#A32D2D"
-REFERENCE_LINE = "rgba(136, 135, 128, 0.5)"  # faint gray, no label
-VWAP_LINE = "#7F77DD"  # purple, distinct from support/resistance/candles
+# TradingView-style dark theme palette
+BG_COLOR = "#131722"
+GRID_COLOR = "rgba(255, 255, 255, 0.06)"
+TEXT_COLOR = "#D1D4DC"
+
+CANDLE_UP = "#26A69A"
+CANDLE_DOWN = "#EF5350"
+
+SUPPORT_FILL = "rgba(38, 166, 154, 0.10)"
+SUPPORT_LINE = "#26A69A"
+RESISTANCE_FILL = "rgba(239, 83, 80, 0.10)"
+RESISTANCE_LINE = "#EF5350"
+REFERENCE_LINE = "rgba(209, 212, 220, 0.25)"  # faint, no label
+VWAP_LINE = "#FF9800"  # orange, standard VWAP color on trading platforms
+LTP_LINE = "#2962FF"
 
 
 def _pct_from_label(label):
@@ -55,8 +65,8 @@ def plot_candles_with_zones(df, composite_zones=None, intraday_zones=None,
     fig.add_trace(go.Candlestick(
         x=df["timestamp"],
         open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-        increasing_line_color="#639922",
-        decreasing_line_color="#E24B4A",
+        increasing_line_color=CANDLE_UP, increasing_fillcolor=CANDLE_UP,
+        decreasing_line_color=CANDLE_DOWN, decreasing_fillcolor=CANDLE_DOWN,
         name="Price",
     ))
 
@@ -98,7 +108,7 @@ def plot_candles_with_zones(df, composite_zones=None, intraday_zones=None,
         )
         fig.add_shape(
             type="line", x0=x0, x1=x1, y0=z["price_mode"], y1=z["price_mode"],
-            line=dict(color=line_color, width=2, dash="dash"),
+            line=dict(color=line_color, width=1.5, dash="dash"),
         )
 
         label_y = z["price_mode"]
@@ -114,28 +124,39 @@ def plot_candles_with_zones(df, composite_zones=None, intraday_zones=None,
             arrowhead=0, arrowwidth=1, arrowcolor=line_color,
             ax=45, ay=0,
             xanchor="left", font=dict(size=11, color=line_color),
-            bgcolor="rgba(255,255,255,0.9)",
+            bgcolor="rgba(19, 23, 34, 0.9)",
             bordercolor=line_color, borderwidth=1, borderpad=3,
         )
 
     # marker for last close so it's obvious where "current price" sits
     fig.add_shape(
         type="line", x0=x0, x1=x1, y0=last_close, y1=last_close,
-        line=dict(color="#185FA5", width=1, dash="solid"),
+        line=dict(color=LTP_LINE, width=1, dash="solid"),
     )
     fig.add_annotation(
         x=x0, y=last_close, text=f"LTP {last_close:.0f}",
-        showarrow=False, xanchor="right", font=dict(size=10, color="#185FA5"),
-        bgcolor="rgba(255,255,255,0.9)",
+        showarrow=False, xanchor="right", font=dict(size=10, color=LTP_LINE),
+        bgcolor="rgba(19, 23, 34, 0.9)",
     )
 
     fig.update_layout(
-        title=title,
-        xaxis_title=None, yaxis_title="Price",
-        xaxis_rangeslider_visible=False,
+        title=dict(text=title, font=dict(color=TEXT_COLOR, size=16)),
+        paper_bgcolor=BG_COLOR,
+        plot_bgcolor=BG_COLOR,
+        font=dict(color=TEXT_COLOR),
+        xaxis=dict(
+            title=None, gridcolor=GRID_COLOR, showgrid=True,
+            rangeslider_visible=False, color=TEXT_COLOR,
+        ),
+        yaxis=dict(
+            title="Price", gridcolor=GRID_COLOR, showgrid=True, color=TEXT_COLOR,
+        ),
         height=550,
         margin=dict(l=60, r=150, t=40, b=30),
         showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            font=dict(color=TEXT_COLOR), bgcolor="rgba(0,0,0,0)",
+        ),
     )
     return fig
