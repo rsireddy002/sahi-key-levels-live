@@ -13,6 +13,8 @@ Builds on the sahi-key-levels module (vendored below, UNCHANGED) to add:
      fix already applied in hvn-lvn-scanner: an after-hours refresh pulls
      Upstox's frozen post-close quotes, which must not get logged as a
      live signal).
+  4. A Chart tab: candlesticks for today's session with composite,
+     intraday, and validated zones overlaid (see candles_with_levels.py).
 
 VENDORED FILES (copied unchanged from their source repos, per instruction
 to leave the original logic untouched):
@@ -38,7 +40,7 @@ THREE-TIER REFRESH MODEL (deliberate, not accidental complexity):
     responsive without re-fetching candles on every tick.
 
 SETUP:
-    pip install streamlit requests pandas numpy --break-system-packages
+    pip install streamlit requests pandas numpy plotly --break-system-packages
     $env:UPSTOX_ACCESS_TOKEN = "your_token_here"
     streamlit run app.py
 """
@@ -57,6 +59,7 @@ from streamlit_autorefresh import st_autorefresh
 from hvn_lvn import build_volume_profile, find_hvn_lvn
 from sahi_style_key_levels import sahi_style_key_levels
 from zone_validation import cross_validated_zones, compute_zone_signal
+from candles_with_levels import plot_candles_with_zones
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -236,16 +239,41 @@ def compute_intraday_zones(today_only_df):
         return []
 
 
+def fetch_intraday_candles(instrument_key, token, unit="minutes", interval="5"):
+    """Upstox's historical-candle endpoint (fetch_candles above) NEVER
+    includes the still-open trading day -- it only has data up through
+    yesterday's final close. Today's still-forming candles require this
+    separate intraday endpoint. Without this, "today's" fetch silently
+    returns only yesterday's last candle, which looks like a frozen/stale
+    chart rather than an obvious error."""
+    url = f"https://api.upstox.com/v3/historical-candle/intraday/{instrument_key}/{unit}/{interval}"
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+    resp = requests.get(url, headers=headers, timeout=20)
+    resp.raise_for_status()
+    candles = resp.json().get("data", {}).get("candles", [])
+    if not candles:
+        return pd.DataFrame()
+    df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    df["date"] = df["timestamp"].dt.date
+    return df
+
+
 def fetch_today_candles(instrument_key, token):
-    """Lighter than the Precompute fetch: only spans yesterday->today, so
-    each call returns at most ~150 5-min bars instead of 18 days' worth.
-    Still one HTTP call per symbol -- see the "Refresh Zones" docstring
-    note above about not wiring this to the fast quote-refresh loop."""
+    """Today's session candles via the intraday endpoint. Falls back to
+    the historical endpoint's last available day (e.g. before market
+    open, when the intraday endpoint may return nothing yet) so the
+    Chart/zone functions always get something to work with."""
+    df = fetch_intraday_candles(instrument_key, token, "minutes", "5")
+    if not df.empty:
+        return df
+
     df = fetch_candles(instrument_key, token, "minutes", "5", lookback_days=1)
     if df.empty:
         return df
-    today = df["date"].max()
-    return df[df["date"] == today]
+    latest = df["date"].max()
+    return df[df["date"] == latest]
 
 
 def run_precompute(token, progress_callback=None):
@@ -477,7 +505,7 @@ def build_zones_display_df(zones):
     return df.sort_values("Level", ascending=False).reset_index(drop=True)
 
 
-# ---------------- UI (three tabs: Scanner, Key Levels, Alerts) ----------------
+# ---------------- UI (four tabs: Scanner, Key Levels, Chart, Alerts) ----------------
 st.set_page_config(page_title="Sahi Key Levels LIVE", layout="wide")
 st.title("Sahi Key Levels LIVE")
 st.caption(
@@ -547,7 +575,10 @@ if os.path.exists(CACHE_PATH):
     price_lookup = dict(zip(df["Symbol"], df["LTP"])) if not df.empty else {}
     alert_log = st.session_state.get("alert_log") or load_alert_log()
 
-    tab_scanner, tab_levels, tab_alerts = st.tabs(["Scanner", "Key Levels", "Alerts"])
+    symbols_with_zones = [s for s in cache if cache[s].get("composite_zones") or cache[s].get("intraday_zones")]
+    default_idx = symbols_with_zones.index("NIFTY") if "NIFTY" in symbols_with_zones else 0
+
+    tab_scanner, tab_levels, tab_chart, tab_alerts = st.tabs(["Scanner", "Key Levels", "Chart", "Alerts"])
 
     with tab_scanner:
         st.caption(f"Last refreshed: {st.session_state.get('last_refresh_time', 'never')}")
@@ -561,12 +592,10 @@ if os.path.exists(CACHE_PATH):
             "Composite = 18-day profile (updates on Precompute). Intraday = today's session "
             "(updates on Refresh Zones). Only overlapping ranges across both count as validated."
         )
-        symbols_with_zones = [s for s in cache if cache[s].get("composite_zones") or cache[s].get("intraday_zones")]
         if not symbols_with_zones:
             st.write("No zones available yet - click 'Run Precompute'.")
         else:
-            default_idx = symbols_with_zones.index("NIFTY") if "NIFTY" in symbols_with_zones else 0
-            selected_symbol = st.selectbox("Symbol", symbols_with_zones, index=default_idx)
+            selected_symbol = st.selectbox("Symbol", symbols_with_zones, index=default_idx, key="levels_symbol")
             c = cache[selected_symbol]
             st.caption(f"Zones last updated: {c.get('zones_updated_at', 'never')}")
 
@@ -589,6 +618,31 @@ if os.path.exists(CACHE_PATH):
                 st.write("No cross-validated zones yet.")
             else:
                 st.dataframe(validated_display, use_container_width=True, hide_index=True)
+
+    with tab_chart:
+        if not symbols_with_zones:
+            st.write("No zones available yet - click 'Run Precompute'.")
+        else:
+            chart_symbol = st.selectbox("Symbol", symbols_with_zones, index=default_idx, key="chart_symbol")
+            c = cache[chart_symbol]
+            token = get_token()
+
+            chart_df = fetch_today_candles(c["instrument_key"], token)
+
+            if chart_df.empty:
+                st.write("No candle data yet for today.")
+            else:
+                val_comp, val_intra, _ = cross_validated_zones(
+                    c.get("composite_zones", []), c.get("intraday_zones", [])
+                )
+                fig = plot_candles_with_zones(
+                    chart_df,
+                    composite_zones=c.get("composite_zones", []),
+                    intraday_zones=c.get("intraday_zones", []),
+                    validated_zones=val_comp,
+                    title=f"{chart_symbol} - price with key levels",
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
     with tab_alerts:
         st.caption(
